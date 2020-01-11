@@ -6,10 +6,12 @@ import socket
 import ipaddress
 import threading
 import pickle
+import hashlib
 
 def logger(f):
     def inner(*args, **kwargs):
-        name = f'{__name__}.{f.__qualname__}'
+        # name = f'{__name__}.{f.__qualname__}'
+        name = f'{f.__qualname__}'
         return f(*args, **kwargs, log=logging.getLogger(name))
     return inner
 
@@ -20,6 +22,14 @@ def threaded(f, log):
         log.debug(f'starting thread {t}')
         t.start()
     return inner
+
+def hash_data(data):
+    m = hashlib.md5()
+    if not type(data) is bytes:
+        m.update(pickle.dumps(data))
+    else:
+        m.update(data)
+    return m.hexdigest()
 
 class SETTINGS:
     __slots__ = ()
@@ -34,6 +44,7 @@ class MSG_TYPE:
     __slots__ = ()
 
     HANDSHAKE = 0
+    UPDATE_PEERS = 1
 
 MSG_TYPE = MSG_TYPE()
 
@@ -131,6 +142,9 @@ class ReceiveSocket:
         log.debug(f'finished reading message from {remote_ip}')
         return data
 
+    def remote_ip(self):
+        return self.csock.getpeername()[0]
+
 def encoder(msg_type, payload):
     return pickle.dumps({
         'type': msg_type,
@@ -153,11 +167,15 @@ class Server:
     def __init__(self, port, log):
         self.ip = get_ip()
         self.port = port
-        self.start()
+        self.peers = set([self.ip])
+
+        self.peer_lock = threading.Lock()
+
+        self.listen_loop()
 
     @threaded
     @logger
-    def start(self, log):
+    def listen_loop(self, log):
         log.info(f'starting server on {self.ip}:{self.port}')
 
         with ServerSocket(self.ip, self.port) as sock:
@@ -170,18 +188,63 @@ class Server:
     @logger
     def handler(self, csock, log):
         msg_type, payload = decoder(csock.read())
+        src = csock.remote_ip()
         log.info(f'received message of type {msg_type}')
 
+        if msg_type == MSG_TYPE.HANDSHAKE:
+            self.add_peer(src)
+        elif msg_type == MSG_TYPE.UPDATE_PEERS:
+            self.update_peers(src, payload)
+
+    @logger
+    def add_peer(self, ip, log):
+        with self.peer_lock:
+            if not ip in self.peers:
+                log.warning(f'adding peer {ip} to network')
+                self.peers.add(ip)
+                POST(ip, MSG_TYPE.UPDATE_PEERS, self.peers)
+
+    @logger
+    def update_peers(self, src, ngh_peers, log):
+        with self.peer_lock:
+            new_peers = ngh_peers - self.peers
+            if new_peers:
+                log.warning(f'received {len(new_peers)} from neighbour {src}')
+                self.peers = self.peers.union(new_peers)
+
+            new_peers = self.peers - ngh_peers
+            if new_peers:
+                log.info(f'sending peers back to {src}')
+                POST(src, MSG_TYPE.UPDATE_PEERS, new_peers)
+
 class PeeringServer:
-    def __init__(self, server, remote_port):
+    def __init__(self, server, remote_port, network_prefix):
         self.remote_port = remote_port
         self.server = server
-        ping_peers()
+        self.network_prefix = network_prefix
+        self.find_peers()
 
     @threaded
-    @log
-    def ping_peers(self, log):
-        log.info(f'starting peer discovery server')
+    @logger
+    def find_peers(self, log):
+        net = ipaddress.ip_network(f'{get_ip()}/{self.network_prefix}',
+                strict=False)
+        log.info(f'starting peer discovery on {net}')
+
+        own_ip = get_ip()
+        for host in map(str, net.hosts()):
+            if host != own_ip:
+                self.ping_ip(host)
+
+    @threaded
+    @logger
+    def ping_ip(self, ip, log):
+        log.debug(f'trying to peer with {ip}')
+        try:
+            POST(ip, MSG_TYPE.HANDSHAKE, None)
+            log.info(f'handshake sent to {ip}')
+        except:
+            log.debug(f'unable to connect to {ip}')
 
 @logger
 def main(log):
@@ -234,7 +297,7 @@ def main(log):
         seeded = ans
 
     server = Server(cmd_args.port)
-    peer_finder = PeeringServer(server, cmd_args.port)
+    peer_finder = PeeringServer(server, cmd_args.port, cmd_args.prefix)
 
 if __name__ == '__main__':
     main()
