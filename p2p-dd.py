@@ -13,6 +13,14 @@ def logger(f):
         return f(*args, **kwargs, log=logging.getLogger(name))
     return inner
 
+@logger
+def threaded(f, log):
+    def inner(*args, **kwargs):
+        t = threading.Thread(target=f, args=args, kwargs=kwargs)
+        log.debug(f'starting thread {t}')
+        t.start()
+    return inner
+
 class SETTINGS:
     __slots__ = ()
 
@@ -67,13 +75,34 @@ class ClientSocket:
         self.sock.sendall(msg_size + data)
 
 class ServerSocket:
+    def __init__(self, ip, port):
+        self.ip = ip
+        self.port = port
+
+    @logger
+    def __enter__(self, log):
+        log.debug(f'starting server socket on {self.ip}:{self.port}')
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind((self.ip, self.port))
+        self.sock.listen()
+        return self
+
+    @logger
+    def __exit__(self, *args, log):
+        log.debug(f'closing server socket on {self.ip}:{self.port}')
+        self.sock.close()
+
+    @logger
+    def accept(self, log):
+        csock, addr = self.sock.accept()
+        log.debug(f'accepted connection from {addr[0]}:{addr[1]}')
+        return ReceiveSocket(csock)
+
+class ReceiveSocket:
     def __init__(self, csock):
         self.csock = csock
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
+    def __del__(self):
         self.csock.close()
 
     @logger
@@ -85,7 +114,7 @@ class ServerSocket:
             cp = 0
             chunks = bytearray()
             while cp < size:
-                chunk = sock.recv(min(SETTINGS.RECEIVE_BUFFER_SIZE, size))
+                chunk = self.csock.recv(min(SETTINGS.RECEIVE_BUFFER_SIZE, size))
                 if not chunk:
                     break
                 cp += len(chunk)
@@ -119,58 +148,40 @@ def POST(remote, msg_type, payload, log):
     with ClientSocket(remote, cmd_args.port) as sock:
         sock.send(encoder(msg_type, payload))
 
-class PeerHandshake(threading.Thread):
-    def __init__(self, csock):
-        self.csock = csock
-
-        super().__init__()
-
+class Server:
     @logger
-    def run(self, log):
-        log.debug(f'starting handshake with {self.csock}')
-
-class PeeringServer(threading.Thread):
-    def __init__(self, listen_ip, listen_port):
-        self.ip = str(listen_ip)
-        self.port = listen_port
-
-        super().__init__()
-
-    @logger
-    def run(self, log):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind((self.ip, self.port))
-            sock.listen()
-
-            log.info(f'peering server started on {sock.getsockname()}')
-
-            while True:
-                csock, addr = sock.accept()
-                log.debug(f'incoming connection from {addr}')
-                PeerHandshake(csock).start()
-
-class Peer:
-    @logger
-    def __init__(self, seeded, prefix, port, log):
-        self.ip = ipaddress.ip_address(get_ip())
+    def __init__(self, port, log):
+        self.ip = get_ip()
         self.port = port
-        self.network = ipaddress.ip_network(f'{self.ip}/{prefix}', strict=False)
-        self.peer_id = str(self.ip)
+        self.start()
 
-        log.info(f'peer created with peer-id {self.peer_id}')
-        self.start_peering()
-
+    @threaded
     @logger
-    def start_peering(self, log):
-        log.info(f'starting peer discovery on network {self.network}')
+    def start(self, log):
+        log.info(f'starting server on {self.ip}:{self.port}')
 
-        self.start_peer_server()
+        with ServerSocket(self.ip, self.port) as sock:
+            log.debug(f'ready to accept connections on {self.ip}:{self.port}')
+            while True:
+                csock = sock.accept()
+                self.handler(csock)
 
+    @threaded
     @logger
-    def start_peer_server(self, log):
-        log.info(f'starting peer server on {self.ip}')
-        self.peering_server = PeeringServer(self.ip, self.port)
-        self.peering_server.start()
+    def handler(self, csock, log):
+        msg_type, payload = decoder(csock.read())
+        log.info(f'received message of type {msg_type}')
+
+class PeeringServer:
+    def __init__(self, server, remote_port):
+        self.remote_port = remote_port
+        self.server = server
+        ping_peers()
+
+    @threaded
+    @log
+    def ping_peers(self, log):
+        log.info(f'starting peer discovery server')
 
 @logger
 def main(log):
@@ -222,7 +233,8 @@ def main(log):
             break
         seeded = ans
 
-    peer = Peer(seeded=seeded, prefix=cmd_args.prefix, port=cmd_args.port)
+    server = Server(cmd_args.port)
+    peer_finder = PeeringServer(server, cmd_args.port)
 
 if __name__ == '__main__':
     main()
