@@ -163,9 +163,10 @@ def post(remote, msg_type, payload, log):
 
 class Server:
     class Peer:
-        def __init__(self, ip, seeded):
+        def __init__(self, ip, seeded=False, seeding=False):
             self.ip = ip
             self.seeded = seeded
+            self.seeding = seeding
 
         def __eq__(self, other):
             return self.ip == other.ip
@@ -179,8 +180,10 @@ class Server:
     @logger
     def __init__(self, port, seeded, log):
         self.ip = get_ip()
-        self.seeded = seeded
-        self.peers = set([Server.Peer(self.ip, self.seeded)])
+
+        self.info = Server.Peer(self.ip, seeded, False)
+        self.peers = set()
+
         self.port = port
 
         self.peer_lock = threading.Lock()
@@ -211,23 +214,23 @@ class Server:
             self.update_peers(src, payload)
 
     @logger
-    def add_peer(self, ip, seeded, log):
+    def add_peer(self, ip, peer, log):
         with self.peer_lock:
-            peer = Server.Peer(ip, seeded)
-            if not peer in self.peers:
-                log.warning(f'adding peer {peer} to network')
-                self.peers.add(peer)
-            post(ip, MSG_TYPE.UPDATE_PEERS, self.peers)
+            log.warning(f'adding peer {peer} to network')
+            # replace peer if it exists
+            self.peers.discard(peer)
+            self.peers.add(peer)
+            post(ip, MSG_TYPE.UPDATE_PEERS, self.peers - {peer})
 
     @logger
     def update_peers(self, src, ngh_peers, log):
         with self.peer_lock:
             new_peers = ngh_peers - self.peers
             if new_peers:
-                log.warning(f'received {len(new_peers)} from neighbour {src}')
+                log.warning(f'received {len(new_peers)} peer(s) from {src}')
                 self.peers = self.peers.union(new_peers)
 
-            new_peers = self.peers - ngh_peers
+            new_peers = self.peers - ngh_peers - {Server.Peer(src)}
             if new_peers:
                 log.info(f'sending peers back to {src}')
                 post(src, MSG_TYPE.UPDATE_PEERS, new_peers)
@@ -256,7 +259,7 @@ class PeeringServer:
     def ping_ip(self, ip, log):
         log.debug(f'trying to peer with {ip}')
         try:
-            post(ip, MSG_TYPE.HANDSHAKE, self.server.seeded)
+            post(ip, MSG_TYPE.HANDSHAKE, self.server.info)
             log.info(f'handshake sent to {ip}')
         except:
             log.debug(f'unable to connect to {ip}')
