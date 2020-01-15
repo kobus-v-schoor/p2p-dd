@@ -10,7 +10,6 @@ import hashlib
 
 def logger(f):
     def inner(*args, **kwargs):
-        # name = f'{__name__}.{f.__qualname__}'
         name = f'{f.__qualname__}'
         return f(*args, **kwargs, log=logging.getLogger(name))
     return inner
@@ -156,18 +155,33 @@ def decoder(data):
     return data['type'], data['payload']
 
 @logger
-def POST(remote, msg_type, payload, log):
+def post(remote, msg_type, payload, log):
     log.debug(f'posting message of type {msg_type} to {remote}')
 
     with ClientSocket(remote, cmd_args.port) as sock:
         sock.send(encoder(msg_type, payload))
 
 class Server:
+    class Peer:
+        def __init__(self, ip, seeded):
+            self.ip = ip
+            self.seeded = seeded
+
+        def __eq__(self, other):
+            return self.ip == other.ip
+
+        def __hash__(self):
+            return hash(self.ip)
+
+        def __str__(self):
+            return f'{self.ip} (seeded: {self.seeded})'
+
     @logger
-    def __init__(self, port, log):
+    def __init__(self, port, seeded, log):
         self.ip = get_ip()
+        self.seeded = seeded
+        self.peers = set([Server.Peer(self.ip, self.seeded)])
         self.port = port
-        self.peers = set([self.ip])
 
         self.peer_lock = threading.Lock()
 
@@ -192,17 +206,18 @@ class Server:
         log.info(f'received message of type {msg_type}')
 
         if msg_type == MSG_TYPE.HANDSHAKE:
-            self.add_peer(src)
+            self.add_peer(src, payload)
         elif msg_type == MSG_TYPE.UPDATE_PEERS:
             self.update_peers(src, payload)
 
     @logger
-    def add_peer(self, ip, log):
+    def add_peer(self, ip, seeded, log):
         with self.peer_lock:
-            if not ip in self.peers:
-                log.warning(f'adding peer {ip} to network')
-                self.peers.add(ip)
-                POST(ip, MSG_TYPE.UPDATE_PEERS, self.peers)
+            peer = Server.Peer(ip, seeded)
+            if not peer in self.peers:
+                log.warning(f'adding peer {peer} to network')
+                self.peers.add(peer)
+            post(ip, MSG_TYPE.UPDATE_PEERS, self.peers)
 
     @logger
     def update_peers(self, src, ngh_peers, log):
@@ -215,7 +230,7 @@ class Server:
             new_peers = self.peers - ngh_peers
             if new_peers:
                 log.info(f'sending peers back to {src}')
-                POST(src, MSG_TYPE.UPDATE_PEERS, new_peers)
+                post(src, MSG_TYPE.UPDATE_PEERS, new_peers)
 
 class PeeringServer:
     def __init__(self, server, remote_port, network_prefix):
@@ -241,7 +256,7 @@ class PeeringServer:
     def ping_ip(self, ip, log):
         log.debug(f'trying to peer with {ip}')
         try:
-            POST(ip, MSG_TYPE.HANDSHAKE, None)
+            post(ip, MSG_TYPE.HANDSHAKE, self.server.seeded)
             log.info(f'handshake sent to {ip}')
         except:
             log.debug(f'unable to connect to {ip}')
@@ -296,7 +311,7 @@ def main(log):
             break
         seeded = ans
 
-    server = Server(cmd_args.port)
+    server = Server(cmd_args.port, seeded)
     peer_finder = PeeringServer(server, cmd_args.port, cmd_args.prefix)
 
 if __name__ == '__main__':
