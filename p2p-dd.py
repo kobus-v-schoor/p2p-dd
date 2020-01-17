@@ -7,6 +7,8 @@ import ipaddress
 import threading
 import pickle
 import hashlib
+import random
+import time
 
 def logger(f):
     def inner(*args, **kwargs):
@@ -36,14 +38,27 @@ class SETTINGS:
     MESSAGE_SIZE_BYTES = 8
     BYTE_ORDER = 'big'
     RECEIVE_BUFFER_SIZE = 1024 # in bytes
+    BUSY_TIMEOUT = 10
 
 SETTINGS = SETTINGS()
 
 class MSG_TYPE:
     __slots__ = ()
 
+    # ask peer to connect
     HANDSHAKE = 0
+    # send peer own peers
     UPDATE_PEERS = 1
+    # update peer with own info
+    UPDATE_INFO = 2
+    # ask peer to download
+    WANT_DOWNLOAD = 3
+    # tell peer we cannot serve download to them
+    DOWNLOAD_REFUSED = 4
+    # tell peer we can server download to them
+    DOWNLOAD_OK = 5
+    # tell peer that download is finished
+    DOWNLOAD_DONE = 6
 
 MSG_TYPE = MSG_TYPE()
 
@@ -155,7 +170,7 @@ def decoder(data):
     return data['type'], data['payload']
 
 @logger
-def post(remote, msg_type, payload, log):
+def post(remote, msg_type, payload=None, log=None):
     log.debug(f'posting message of type {msg_type} to {remote}')
 
     with ClientSocket(remote, cmd_args.port) as sock:
@@ -163,10 +178,10 @@ def post(remote, msg_type, payload, log):
 
 class Server:
     class Peer:
-        def __init__(self, ip, seeded=False, seeding=False):
+        def __init__(self, ip, seeded=False):
             self.ip = ip
             self.seeded = seeded
-            self.seeding = seeding
+            self.busy = False
 
         def __eq__(self, other):
             return self.ip == other.ip
@@ -181,14 +196,16 @@ class Server:
     def __init__(self, port, seeded, log):
         self.ip = get_ip()
 
-        self.info = Server.Peer(self.ip, seeded, False)
+        self.info = Server.Peer(self.ip, seeded)
         self.peers = set()
 
         self.port = port
 
         self.peer_lock = threading.Lock()
+        self.info_lock = threading.Lock()
 
         self.listen_loop()
+        self.get_busy()
 
     @threaded
     @logger
@@ -212,6 +229,18 @@ class Server:
             self.add_peer(src, payload)
         elif msg_type == MSG_TYPE.UPDATE_PEERS:
             self.update_peers(src, payload)
+        elif msg_type == MSG_TYPE.UPDATE_INFO:
+            self.update_info(payload)
+        elif msg_type == MSG_TYPE.WANT_DOWNLOAD:
+            self.serve_download(src)
+        elif msg_type == MSG_TYPE.DOWNLOAD_REFUSED:
+            self.download_refused(src)
+        elif msg_type == MSG_TYPE.DOWNLOAD_OK:
+            self.download_ok(src)
+        elif msg_type == MSG_TYPE.DOWNLOAD_DONE:
+            self.download_done()
+        else:
+            log.error(f'received unknown message of type {msg_type}')
 
     @logger
     def add_peer(self, ip, peer, log):
@@ -220,7 +249,8 @@ class Server:
             # replace peer if it exists
             self.peers.discard(peer)
             self.peers.add(peer)
-            post(ip, MSG_TYPE.UPDATE_PEERS, self.peers - {peer})
+            peer_list = {self.info}.union(self.peers - {peer})
+            post(ip, MSG_TYPE.UPDATE_PEERS, peer_list)
 
     @logger
     def update_peers(self, src, ngh_peers, log):
@@ -234,6 +264,88 @@ class Server:
             if new_peers:
                 log.info(f'sending peers back to {src}')
                 post(src, MSG_TYPE.UPDATE_PEERS, new_peers)
+
+    # make sure that you lock info before calling this
+    @logger
+    def resend_info(self, log):
+        log.info('sending updated info to peers')
+        for peer in self.peers:
+            post(peer.ip, MSG_TYPE.UPDATE_INFO, self.info)
+
+    @logger
+    def update_info(self, peer, log):
+        with self.peer_lock:
+            log.info(f'updating info for {peer.ip}')
+            self.peers.discard(peer)
+            self.peers.add(peer)
+
+    @threaded
+    @logger
+    def get_busy(self, log):
+        log.info('server getting busy')
+
+        while True:
+            with self.info_lock:
+                if self.info.seeded or self.info.busy:
+                    log.info('server done getting busy')
+                    break
+
+            log.debug('attempting to find a peer to download from')
+
+            with self.peer_lock:
+                options = [p for p in self.peers if p.seeded and not p.busy]
+
+            if not options:
+                log.info('unable to find a suitable peer, waiting')
+            else:
+                peer = random.choice(options)
+                log.info(f'asking {peer.ip} to download from them')
+                post(peer.ip, MSG_TYPE.WANT_DOWNLOAD)
+
+            time.sleep(SETTINGS.BUSY_TIMEOUT)
+
+    @logger
+    def serve_download(self, ip, log):
+        with self.info_lock:
+            if self.info.busy or not self.info.seeded:
+                log.info(f'unable to serve download to {ip}')
+                post(ip, MSG_TYPE.DOWNLOAD_REFUSED)
+                return
+
+            log.warning(f'serving download to {ip}')
+            self.info.busy = True
+            post(ip, MSG_TYPE.DOWNLOAD_OK)
+            self.resend_info()
+
+        # read and send data
+        time.sleep(3)
+
+        log.warning(f'finished serving download to {ip}')
+        post(ip, MSG_TYPE.DOWNLOAD_DONE)
+        with self.info_lock:
+            self.info.busy = False
+            self.resend_info()
+
+    @logger
+    def download_refused(self, ip, log):
+        log.info(f'download request from {ip} was refused, retrying')
+
+    @logger
+    def download_ok(self, ip, log):
+        log.warning(f'starting download from {ip}')
+
+        with self.info_lock:
+            self.info.busy = True
+            self.resend_info()
+
+    @logger
+    def download_done(self, log):
+        log.warning('download finished, updating status')
+
+        with self.info_lock:
+            self.info.seeded = True
+            self.info.busy = False
+            self.resend_info()
 
 class PeeringServer:
     def __init__(self, server, remote_port, network_prefix):
