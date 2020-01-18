@@ -10,6 +10,7 @@ import pickle
 import hashlib
 import random
 import time
+import zlib
 
 def logger(f):
     def inner(*args, **kwargs):
@@ -337,7 +338,7 @@ class Server:
             with open(self.path, 'rb') as f:
                 while pos < size:
                     read_size = min(size - pos, SETTINGS.BLOCK_SIZE)
-                    data = f.read(read_size)
+                    data = zlib.compress(f.read(read_size))
                     post(ip, MSG_TYPE.DOWNLOAD_DATA, {
                         'pos': pos,
                         'data': data
@@ -357,7 +358,7 @@ class Server:
         with self.file_lock:
             with open(self.path, 'rb+') as f:
                 f.seek(pos)
-                f.write(data)
+                f.write(zlib.decompress(data))
 
     @logger
     def download_refused(self, ip, log):
