@@ -11,6 +11,7 @@ import hashlib
 import random
 import time
 import zlib
+import pathlib
 
 def logger(f):
     def inner(*args, **kwargs):
@@ -415,7 +416,7 @@ def main(log):
     parser = argparse.ArgumentParser()
 
     def path_type(a):
-        if not os.path.isfile(a):
+        if not os.path.isfile(a) and not pathlib.Path(a).is_block_device():
             raise argparse.ArgumentTypeError(f'path {a} doesn\'t exist or '
                     'isn\'t a file')
         return a
