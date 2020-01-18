@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 
 import argparse
+import os
 import logging
 import socket
 import ipaddress
@@ -39,6 +40,7 @@ class SETTINGS:
     BYTE_ORDER = 'big'
     RECEIVE_BUFFER_SIZE = 1024 # in bytes
     BUSY_TIMEOUT = 10
+    BLOCK_SIZE = 10485760 # 10MB
 
 SETTINGS = SETTINGS()
 
@@ -59,6 +61,8 @@ class MSG_TYPE:
     DOWNLOAD_OK = 5
     # tell peer that download is finished
     DOWNLOAD_DONE = 6
+    # contains file data
+    DOWNLOAD_DATA = 7
 
 MSG_TYPE = MSG_TYPE()
 
@@ -193,8 +197,10 @@ class Server:
             return f'{self.ip} (seeded: {self.seeded})'
 
     @logger
-    def __init__(self, port, seeded, log):
+    def __init__(self, port, seeded, path, log):
         self.ip = get_ip()
+
+        self.path = path
 
         self.info = Server.Peer(self.ip, seeded)
         self.peers = set()
@@ -203,6 +209,7 @@ class Server:
 
         self.peer_lock = threading.Lock()
         self.info_lock = threading.Lock()
+        self.file_lock = threading.Lock()
 
         self.listen_loop()
         self.get_busy()
@@ -210,7 +217,7 @@ class Server:
     @threaded
     @logger
     def listen_loop(self, log):
-        log.info(f'starting server on {self.ip}:{self.port}')
+        log.warning(f'starting server on {self.ip}:{self.port}')
 
         with ServerSocket(self.ip, self.port) as sock:
             log.debug(f'ready to accept connections on {self.ip}:{self.port}')
@@ -223,7 +230,7 @@ class Server:
     def handler(self, csock, log):
         msg_type, payload = decoder(csock.read())
         src = csock.remote_ip()
-        log.info(f'received message of type {msg_type}')
+        log.debug(f'received message of type {msg_type}')
 
         if msg_type == MSG_TYPE.HANDSHAKE:
             self.add_peer(src, payload)
@@ -239,6 +246,8 @@ class Server:
             self.download_ok(src)
         elif msg_type == MSG_TYPE.DOWNLOAD_DONE:
             self.download_done()
+        elif msg_type == MSG_TYPE.DOWNLOAD_DATA:
+            self.write_data(**payload)
         else:
             log.error(f'received unknown message of type {msg_type}')
 
@@ -317,14 +326,38 @@ class Server:
             post(ip, MSG_TYPE.DOWNLOAD_OK)
             self.resend_info()
 
-        # read and send data
-        time.sleep(3)
+        # works for files and block devices
+        def get_file_size(path):
+            with open(path, 'rb') as f:
+                return f.seek(0, 2)
+
+        pos = 0
+        size = get_file_size(self.path)
+        with self.file_lock:
+            with open(self.path, 'rb') as f:
+                while pos < size:
+                    read_size = min(size - pos, SETTINGS.BLOCK_SIZE)
+                    data = f.read(read_size)
+                    post(ip, MSG_TYPE.DOWNLOAD_DATA, {
+                        'pos': pos,
+                        'data': data
+                        })
+                    pos += read_size
 
         log.warning(f'finished serving download to {ip}')
         post(ip, MSG_TYPE.DOWNLOAD_DONE)
         with self.info_lock:
             self.info.busy = False
             self.resend_info()
+
+    @logger
+    def write_data(self, pos, data, log):
+        log.debug(f'writing {len(data)} bytes at pos {pos}')
+
+        with self.file_lock:
+            with open(self.path, 'rb+') as f:
+                f.seek(pos)
+                f.write(data)
 
     @logger
     def download_refused(self, ip, log):
@@ -380,7 +413,11 @@ class PeeringServer:
 def main(log):
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('file', help='the file to mirror')
+    def path_type(a):
+        if not os.path.isfile(a):
+            raise argparse.ArgumentTypeError(f'path {a} doesn\'t exist or '
+                    'isn\'t a file')
+        return a
 
     def prefix_type(a):
         a = int(a)
@@ -395,6 +432,8 @@ def main(log):
             raise argparse.ArgumentTypeError('network port must be between'
                     ' 1 and 65535')
         return a
+
+    parser.add_argument('path', type=path_type, help='the path to mirror')
 
     parser.add_argument('--prefix', type=prefix_type, default=24,
             help='the network prefix')
@@ -426,7 +465,7 @@ def main(log):
             break
         seeded = ans
 
-    server = Server(cmd_args.port, seeded)
+    server = Server(cmd_args.port, seeded, cmd_args.path)
     peer_finder = PeeringServer(server, cmd_args.port, cmd_args.prefix)
 
 if __name__ == '__main__':
